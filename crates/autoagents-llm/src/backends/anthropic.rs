@@ -319,7 +319,7 @@ impl Anthropic {
                     ChatRole::Tool => "user",
                 },
                 content: match &m.message_type {
-                    MessageType::Text => vec![MessageContent {
+                    MessageType::Text | MessageType::Advisory => vec![MessageContent {
                         message_type: Some("text"),
                         text: Some(&m.content),
                         image_url: None,

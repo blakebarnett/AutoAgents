@@ -180,12 +180,18 @@ impl ChatResponse for OllamaResponse {
             })
         })
     }
+
+    fn thinking(&self) -> Option<String> {
+        self.message.as_ref().and_then(|m| m.thinking.clone())
+    }
 }
 
 /// Message content within an Ollama chat API response.
 #[derive(Deserialize, Debug)]
 struct OllamaChatResponseMessage {
     content: String,
+    #[serde(default)]
+    thinking: Option<String>,
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
@@ -810,6 +816,7 @@ mod tests {
             response: Some("response".to_string()),
             message: Some(OllamaChatResponseMessage {
                 content: "message".to_string(),
+                thinking: None,
                 tool_calls: None,
             }),
         };
@@ -820,6 +827,7 @@ mod tests {
             response: Some("response".to_string()),
             message: Some(OllamaChatResponseMessage {
                 content: "message".to_string(),
+                thinking: None,
                 tool_calls: None,
             }),
         };
@@ -830,6 +838,7 @@ mod tests {
             response: None,
             message: Some(OllamaChatResponseMessage {
                 content: "message".to_string(),
+                thinking: None,
                 tool_calls: None,
             }),
         };
@@ -843,6 +852,7 @@ mod tests {
             response: None,
             message: Some(OllamaChatResponseMessage {
                 content: "tool".to_string(),
+                thinking: None,
                 tool_calls: Some(vec![OllamaToolCall {
                     function: OllamaFunctionCall {
                         name: "lookup".to_string(),
@@ -864,6 +874,7 @@ mod tests {
             response: None,
             message: Some(OllamaChatResponseMessage {
                 content: "ignored".to_string(),
+                thinking: None,
                 tool_calls: Some(vec![OllamaToolCall {
                     function: OllamaFunctionCall {
                         name: "lookup".to_string(),

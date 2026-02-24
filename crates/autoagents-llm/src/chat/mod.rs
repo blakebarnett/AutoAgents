@@ -199,6 +199,8 @@ pub enum MessageType {
     ToolUse(Vec<ToolCall>),
     /// Tool result
     ToolResult(Vec<ToolCall>),
+    /// Automatically-injected advisory context. Serialized as user-role text.
+    Advisory,
 }
 
 /// The type of reasoning effort for a message in a chat conversation.
@@ -385,6 +387,12 @@ pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send + Sync {
         None
     }
     fn usage(&self) -> Option<Usage> {
+        None
+    }
+    /// Returns the provider-specific response ID, if available.
+    /// For OpenAI Responses API, this is the `response.id` that can be
+    /// passed as `previous_response_id` to chain conversations.
+    fn response_id(&self) -> Option<&str> {
         None
     }
 }

@@ -158,6 +158,13 @@ pub struct LLMBuilder<L: LLMProvider + HasConfig> {
     pub(crate) normalize_response: Option<bool>,
     /// ExtraBody
     pub(crate) extra_body: Option<serde_json::Value>,
+    /// Keep Alive
+    #[allow(dead_code)]
+    pub(crate) keep_alive: Option<String>,
+    /// Whether to use OpenAI's Responses API instead of Chat Completions.
+    /// None = auto-detect from model name, Some(true) = force Responses API,
+    /// Some(false) = force Chat Completions.
+    pub(crate) use_responses_api: Option<bool>,
     /// Provider-specific configuration
     pub config: L::Config,
 }
@@ -187,6 +194,8 @@ impl<L: LLMProvider + HasConfig> Default for LLMBuilder<L> {
             deployment_id: None,
             normalize_response: Some(true), //Defaulting so it accumilates tool calls in streams, easy for agent handling
             extra_body: None,
+            keep_alive: None,
+            use_responses_api: None,
             config: L::Config::default(),
         }
     }
@@ -342,6 +351,19 @@ impl<L: LLMProvider + HasConfig> LLMBuilder<L> {
     pub fn extra_body(mut self, extra_body: impl serde::Serialize) -> Self {
         let value = serde_json::to_value(extra_body).ok();
         self.extra_body = value;
+        self
+    }
+
+    /// Override API selection for the OpenAI backend.
+    ///
+    /// By default, the API is auto-detected from the model name:
+    /// - Codex/reasoning/newer model families (`codex-*`, `o1/o3/o4`, `gpt-5*`) use the Responses API
+    /// - All other models use Chat Completions
+    ///
+    /// Use this to explicitly force one API or the other.
+    /// This setting is ignored by non-OpenAI backends.
+    pub fn use_responses_api(mut self, enabled: bool) -> Self {
+        self.use_responses_api = Some(enabled);
         self
     }
 }

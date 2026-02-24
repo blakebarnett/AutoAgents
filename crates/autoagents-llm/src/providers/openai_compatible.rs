@@ -979,25 +979,62 @@ pub fn chat_message_to_openai_message(chat_msg: ChatMessage) -> OpenAIChatMessag
         },
         tool_call_id: None,
         content: match &chat_msg.message_type {
-            MessageType::Text => Some(Right(chat_msg.content.clone())),
+            MessageType::Text | MessageType::Advisory => Some(Right(chat_msg.content.clone())),
             MessageType::Image((mime, bytes)) => {
                 let url = format!("data:{};base64,{}", mime.mime_type(), BASE64.encode(bytes));
-                Some(Left(vec![OpenAIMessageContent {
+                let mut parts = Vec::with_capacity(2);
+                // Always include a text content block before the image.
+                // Providers like Bedrock require the first ContentBlock to have
+                // a non-blank text field; omitting it or sending an empty string
+                // causes a 400 "The text field in the ContentBlock is blank" error.
+                {
+                    let text_content = if chat_msg.content.is_empty() {
+                        "Describe this image."
+                    } else {
+                        // Leak the content string to get a 'static reference for the multipart message.
+                        // This is a small, bounded allocation per image message.
+                        Box::leak(chat_msg.content.clone().into_boxed_str())
+                    };
+                    parts.push(OpenAIMessageContent {
+                        message_type: Some("text"),
+                        text: Some(text_content),
+                        image_url: None,
+                        tool_output: None,
+                        tool_call_id: None,
+                    });
+                }
+                parts.push(OpenAIMessageContent {
                     message_type: Some("image_url"),
                     text: None,
                     image_url: Some(ImageUrlContent { url }),
                     tool_output: None,
                     tool_call_id: None,
-                }]))
+                });
+                Some(Left(parts))
             }
             MessageType::Pdf(_) => unimplemented!(),
-            MessageType::ImageURL(url) => Some(Left(vec![OpenAIMessageContent {
-                message_type: Some("image_url"),
-                text: None,
-                image_url: Some(ImageUrlContent { url: url.clone() }),
-                tool_output: None,
-                tool_call_id: None,
-            }])),
+            MessageType::ImageURL(url) => {
+                let mut parts = Vec::with_capacity(2);
+                // Include text content block if present (required by some providers like Bedrock)
+                if !chat_msg.content.is_empty() {
+                    let text: &'static str = Box::leak(chat_msg.content.clone().into_boxed_str());
+                    parts.push(OpenAIMessageContent {
+                        message_type: Some("text"),
+                        text: Some(text),
+                        image_url: None,
+                        tool_output: None,
+                        tool_call_id: None,
+                    });
+                }
+                parts.push(OpenAIMessageContent {
+                    message_type: Some("image_url"),
+                    text: None,
+                    image_url: Some(ImageUrlContent { url: url.clone() }),
+                    tool_output: None,
+                    tool_call_id: None,
+                });
+                Some(Left(parts))
+            }
             MessageType::ToolUse(_) => None,
             MessageType::ToolResult(_) => None,
         },
@@ -1600,13 +1637,34 @@ mod tests {
         assert_eq!(openai_msg.role, "user");
         match openai_msg.content.unwrap() {
             Left(parts) => {
-                assert_eq!(parts.len(), 1);
-                assert_eq!(parts[0].message_type, Some("image_url"));
-                assert!(parts[0].text.is_none());
+                // Should have text part + image_url part when content is non-empty
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].message_type, Some("text"));
+                assert_eq!(parts[0].text, Some("describe"));
+                assert_eq!(parts[1].message_type, Some("image_url"));
+                assert!(parts[1].text.is_none());
                 assert_eq!(
-                    parts[0].image_url.as_ref().unwrap().url,
+                    parts[1].image_url.as_ref().unwrap().url,
                     "https://example.com/image.png"
                 );
+            }
+            Right(_) => panic!("Expected multipart content"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_to_openai_message_image_url_no_text() {
+        let msg = ChatMessage {
+            role: ChatRole::User,
+            message_type: MessageType::ImageURL("https://example.com/image.png".to_string()),
+            content: "".to_string(),
+        };
+        let openai_msg = chat_message_to_openai_message(msg);
+        match openai_msg.content.unwrap() {
+            Left(parts) => {
+                // Should have only image_url part when content is empty
+                assert_eq!(parts.len(), 1);
+                assert_eq!(parts[0].message_type, Some("image_url"));
             }
             Right(_) => panic!("Expected multipart content"),
         }
@@ -1647,8 +1705,35 @@ mod tests {
         let content = openai_msg.content.unwrap();
         match content {
             Left(parts) => {
-                assert_eq!(parts.len(), 1);
-                let url = parts[0].image_url.as_ref().unwrap().url.clone();
+                // Always includes text + image_url (Bedrock requires non-blank text)
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].message_type, Some("text"));
+                assert_eq!(parts[0].text, Some("caption"));
+                let url = parts[1].image_url.as_ref().unwrap().url.clone();
+                assert!(url.starts_with("data:image/png;base64,"));
+            }
+            Right(_) => panic!("Expected multipart content"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_to_openai_message_image_base64_no_text() {
+        use crate::chat::ImageMime;
+
+        let msg = ChatMessage {
+            role: ChatRole::User,
+            message_type: MessageType::Image((ImageMime::PNG, vec![1, 2, 3, 4])),
+            content: "".to_string(),
+        };
+        let openai_msg = chat_message_to_openai_message(msg);
+        let content = openai_msg.content.unwrap();
+        match content {
+            Left(parts) => {
+                // Should still have 2 parts — default text placeholder for Bedrock compatibility
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].message_type, Some("text"));
+                assert_eq!(parts[0].text, Some("Describe this image."));
+                let url = parts[1].image_url.as_ref().unwrap().url.clone();
                 assert!(url.starts_with("data:image/png;base64,"));
             }
             Right(_) => panic!("Expected multipart content"),
