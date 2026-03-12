@@ -85,6 +85,14 @@ pub enum OpenAITool {
         tool_type: String,
         function: crate::chat::FunctionTool,
     },
+    /// Responses API function tool format: name/description/parameters at top level.
+    ResponsesFunction {
+        #[serde(rename = "type")]
+        tool_type: String,
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+    },
     WebSearch {
         #[serde(rename = "type")]
         tool_type: String,
@@ -963,6 +971,27 @@ impl OpenAI {
         }
     }
 
+    /// Build tools in the Responses API format where name/description/parameters
+    /// are top-level fields instead of nested under `function`.
+    fn build_responses_function_tools(&self, tools: Option<&[Tool]>) -> Option<Vec<OpenAITool>> {
+        let mut openai_tools: Vec<OpenAITool> = Vec::new();
+        if let Some(tools) = tools {
+            for tool in tools {
+                openai_tools.push(OpenAITool::ResponsesFunction {
+                    tool_type: "function".to_string(),
+                    name: tool.function.name.clone(),
+                    description: tool.function.description.clone(),
+                    parameters: tool.function.parameters.clone(),
+                });
+            }
+        }
+        if openai_tools.is_empty() {
+            None
+        } else {
+            Some(openai_tools)
+        }
+    }
+
     fn resolve_tool_choice_for_request(
         &self,
         tools: &Option<Vec<OpenAITool>>,
@@ -1177,7 +1206,7 @@ impl OpenAI {
         json_schema: Option<StructuredOutputFormat>,
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
         let (instructions, items) = self.prepare_responses_input(messages);
-        let final_tools = self.build_function_tools(tools);
+        let final_tools = self.build_responses_function_tools(tools);
         let request_tool_choice = self.resolve_tool_choice_for_request(&final_tools);
         let text_format = json_schema.map(ResponsesTextFormat::from);
         let reasoning =
@@ -1226,7 +1255,7 @@ impl OpenAI {
         json_schema: Option<StructuredOutputFormat>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
         let (instructions, items) = self.prepare_responses_input(messages);
-        let final_tools = self.build_function_tools(tools);
+        let final_tools = self.build_responses_function_tools(tools);
         let request_tool_choice = self.resolve_tool_choice_for_request(&final_tools);
         let text_format = json_schema.map(ResponsesTextFormat::from);
         let reasoning =
@@ -2090,6 +2119,55 @@ mod tests {
         let provider = make_provider("gpt-4.1");
         let tools = provider.build_function_tools(None);
         assert!(tools.is_none());
+    }
+
+    #[test]
+    fn test_build_responses_function_tools_empty_returns_none() {
+        let provider = make_provider("codex-mini");
+        let tools = provider.build_responses_function_tools(None);
+        assert!(tools.is_none());
+    }
+
+    #[test]
+    fn test_responses_function_tool_serialization() {
+        let tool = OpenAITool::ResponsesFunction {
+            tool_type: "function".to_string(),
+            name: "get_weather".to_string(),
+            description: "Get weather for a city".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"}
+                },
+                "required": ["city"]
+            }),
+        };
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert_eq!(serialized["type"], "function");
+        assert_eq!(serialized["name"], "get_weather");
+        assert_eq!(serialized["description"], "Get weather for a city");
+        assert!(serialized["parameters"].is_object());
+        assert!(serialized.get("function").is_none());
+    }
+
+    #[test]
+    fn test_build_responses_function_tools_produces_flat_format() {
+        let provider = make_provider("codex-mini");
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: crate::chat::FunctionTool {
+                name: "search".to_string(),
+                description: "Search the web".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        }];
+        let result = provider.build_responses_function_tools(Some(&tools)).unwrap();
+        assert_eq!(result.len(), 1);
+        let serialized = serde_json::to_value(&result[0]).unwrap();
+        assert_eq!(serialized["type"], "function");
+        assert_eq!(serialized["name"], "search");
+        assert_eq!(serialized["description"], "Search the web");
+        assert!(serialized.get("function").is_none());
     }
 
     #[test]

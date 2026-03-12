@@ -735,7 +735,9 @@ fn build_google_chat_contents(messages: &[ChatMessage]) -> Vec<GoogleChatContent
         chat_contents.push(GoogleChatContent {
             role,
             parts: match &msg.message_type {
-                MessageType::Text => vec![GoogleContentPart::Text(&msg.content)],
+                MessageType::Text | MessageType::Advisory => {
+                    vec![GoogleContentPart::Text(&msg.content)]
+                }
                 MessageType::Image((image_mime, raw_bytes)) => {
                     vec![GoogleContentPart::InlineData(GoogleInlineData {
                         mime_type: image_mime.mime_type().to_string(),

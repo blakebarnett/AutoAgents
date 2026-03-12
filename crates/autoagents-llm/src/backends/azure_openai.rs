@@ -73,21 +73,18 @@ impl<'a> From<&'a ChatMessage> for AzureOpenAIChatMessage<'a> {
             },
             tool_call_id: None,
             content: match &chat_msg.message_type {
-                MessageType::Text => Some(Right(chat_msg.content.clone())),
-                // Image case is handled separately above
+                MessageType::Text | MessageType::Advisory => {
+                    Some(Right(chat_msg.content.clone()))
+                }
                 MessageType::Image(_) => unreachable!(),
                 MessageType::Pdf(_) => unimplemented!(),
-                MessageType::ImageURL(url) => {
-                    // Clone the URL to create an owned version
-
-                    Some(Left(vec![AzureMessageContent {
-                        message_type: Some("image_url"),
-                        text: None,
-                        image_url: Some(ImageUrlContent { url }),
-                        tool_output: None,
-                        tool_call_id: None,
-                    }]))
-                }
+                MessageType::ImageURL(url) => Some(Left(vec![AzureMessageContent {
+                    message_type: Some("image_url"),
+                    text: None,
+                    image_url: Some(ImageUrlContent { url }),
+                    tool_output: None,
+                    tool_call_id: None,
+                }])),
                 MessageType::ToolUse(_) => None,
                 MessageType::ToolResult(_) => None,
             },
