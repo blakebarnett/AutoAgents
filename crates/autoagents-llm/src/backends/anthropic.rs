@@ -298,15 +298,19 @@ impl ChatResponse for AnthropicCompleteResponse {
     }
 
     fn usage(&self) -> Option<Usage> {
-        self.usage.as_ref().map(|anthropic_usage| Usage {
-            prompt_tokens: anthropic_usage.input_tokens,
-            completion_tokens: anthropic_usage.output_tokens,
-            total_tokens: anthropic_usage.input_tokens + anthropic_usage.output_tokens,
-            completion_tokens_details: None,
-            prompt_tokens_details: anthropic_prompt_tokens_details(
-                anthropic_usage.cache_creation_input_tokens,
-                anthropic_usage.cache_read_input_tokens,
-            ),
+        self.usage.as_ref().and_then(|anthropic_usage| {
+            Some(Usage {
+                prompt_tokens: anthropic_usage.input_tokens,
+                completion_tokens: anthropic_usage.output_tokens,
+                total_tokens: anthropic_usage
+                    .input_tokens
+                    .checked_add(anthropic_usage.output_tokens)?,
+                completion_tokens_details: None,
+                prompt_tokens_details: anthropic_prompt_tokens_details(
+                    anthropic_usage.cache_creation_input_tokens,
+                    anthropic_usage.cache_read_input_tokens,
+                ),
+            })
         })
     }
 }
@@ -1346,6 +1350,24 @@ mod tests {
         assert_eq!(details.cached_tokens, Some(7));
         assert_eq!(details.cache_creation_tokens, Some(2));
         assert_eq!(details.cache_read_tokens, Some(5));
+    }
+
+    #[test]
+    fn anthropic_batch_usage_rejects_total_overflow() {
+        let response: AnthropicCompleteResponse = serde_json::from_str(
+            r#"{
+                "content": [],
+                "usage": {
+                    "input_tokens": 4294967295,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 2,
+                    "cache_read_input_tokens": 5
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(ChatResponse::usage(&response).is_none());
     }
 
     #[test]
