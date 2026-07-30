@@ -85,6 +85,8 @@ impl From<protocol::PromptTokensDetails> for PromptTokensDetails {
     fn from(value: protocol::PromptTokensDetails) -> Self {
         Self {
             cached_tokens: value.cached_tokens,
+            cache_creation_tokens: value.cache_creation_tokens,
+            cache_read_tokens: value.cache_read_tokens,
             audio_tokens: value.audio_tokens,
         }
     }
@@ -94,6 +96,8 @@ impl From<PromptTokensDetails> for protocol::PromptTokensDetails {
     fn from(value: PromptTokensDetails) -> Self {
         Self {
             cached_tokens: value.cached_tokens,
+            cache_creation_tokens: value.cache_creation_tokens,
+            cache_read_tokens: value.cache_read_tokens,
             audio_tokens: value.audio_tokens,
         }
     }
@@ -211,6 +215,8 @@ mod tests {
             }),
             prompt_tokens_details: Some(PromptTokensDetails {
                 cached_tokens: Some(5),
+                cache_creation_tokens: Some(2),
+                cache_read_tokens: Some(3),
                 audio_tokens: None,
             }),
         };
@@ -346,6 +352,8 @@ mod tests {
     fn converts_prompt_tokens_details_roundtrip() {
         let details = PromptTokensDetails {
             cached_tokens: Some(100),
+            cache_creation_tokens: Some(40),
+            cache_read_tokens: Some(60),
             audio_tokens: None,
         };
         let proto: protocol::PromptTokensDetails = details.clone().into();

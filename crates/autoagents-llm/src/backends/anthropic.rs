@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -171,6 +171,23 @@ struct AnthropicStreamResponse {
     content_block: Option<AnthropicStreamContentBlock>,
     /// Delta for content_block_delta and message_delta events
     delta: Option<AnthropicDelta>,
+    /// Message metadata for message_start events
+    message: Option<AnthropicStreamMessage>,
+    /// Usage delta for message_delta events
+    usage: Option<AnthropicStreamUsage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct AnthropicStreamMessage {
+    usage: Option<AnthropicStreamUsage>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnthropicStreamUsage {
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
 }
 
 /// Content block within an Anthropic streaming content_block_start event.
@@ -281,25 +298,35 @@ impl ChatResponse for AnthropicCompleteResponse {
     }
 
     fn usage(&self) -> Option<Usage> {
-        self.usage.as_ref().map(|anthropic_usage| {
-            let cached_tokens = anthropic_usage.cache_creation_input_tokens.unwrap_or(0)
-                + anthropic_usage.cache_read_input_tokens.unwrap_or(0);
-            Usage {
-                prompt_tokens: anthropic_usage.input_tokens,
-                completion_tokens: anthropic_usage.output_tokens,
-                total_tokens: anthropic_usage.input_tokens + anthropic_usage.output_tokens,
-                completion_tokens_details: None,
-                prompt_tokens_details: if cached_tokens > 0 {
-                    Some(crate::chat::PromptTokensDetails {
-                        cached_tokens: Some(cached_tokens),
-                        audio_tokens: None,
-                    })
-                } else {
-                    None
-                },
-            }
+        self.usage.as_ref().map(|anthropic_usage| Usage {
+            prompt_tokens: anthropic_usage.input_tokens,
+            completion_tokens: anthropic_usage.output_tokens,
+            total_tokens: anthropic_usage.input_tokens + anthropic_usage.output_tokens,
+            completion_tokens_details: None,
+            prompt_tokens_details: anthropic_prompt_tokens_details(
+                anthropic_usage.cache_creation_input_tokens,
+                anthropic_usage.cache_read_input_tokens,
+            ),
         })
     }
+}
+
+fn anthropic_prompt_tokens_details(
+    cache_creation_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
+) -> Option<crate::chat::PromptTokensDetails> {
+    if cache_creation_tokens.is_none() && cache_read_tokens.is_none() {
+        return None;
+    }
+
+    Some(crate::chat::PromptTokensDetails {
+        cached_tokens: cache_creation_tokens
+            .unwrap_or(0)
+            .checked_add(cache_read_tokens.unwrap_or(0)),
+        cache_creation_tokens,
+        cache_read_tokens,
+        audio_tokens: None,
+    })
 }
 
 impl Anthropic {
@@ -480,10 +507,7 @@ impl Anthropic {
         reasoning: Option<bool>,
         thinking_budget_tokens: Option<u32>,
     ) -> Self {
-        let mut builder = Client::builder();
-        if let Some(sec) = timeout_seconds {
-            builder = builder.timeout(std::time::Duration::from_secs(sec));
-        }
+        let builder = anthropic_client_builder(timeout_seconds);
         Self {
             api_key: api_key.into(),
             model: model.unwrap_or_else(|| "claude-3-sonnet-20240229".to_string()),
@@ -498,6 +522,18 @@ impl Anthropic {
             client: builder.build().expect("Failed to build reqwest Client"),
         }
     }
+}
+
+fn anthropic_client_builder(timeout_seconds: Option<u64>) -> reqwest::ClientBuilder {
+    let mut builder = harden_anthropic_client_builder(Client::builder());
+    if let Some(sec) = timeout_seconds {
+        builder = builder.timeout(std::time::Duration::from_secs(sec));
+    }
+    builder
+}
+
+fn harden_anthropic_client_builder(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.redirect(Policy::none()).no_proxy()
 }
 
 #[async_trait]
@@ -830,8 +866,12 @@ fn create_anthropic_tool_stream(
     let stream = response
         .bytes_stream()
         .scan(
-            (String::default(), Vec::default(), HashMap::default()),
-            move |(buffer, utf8_buffer, tool_states), chunk| {
+            (
+                String::default(),
+                Vec::default(),
+                AnthropicStreamState::default(),
+            ),
+            move |(buffer, utf8_buffer, stream_state), chunk| {
                 let result = match chunk {
                     Ok(bytes) => {
                         utf8_buffer.extend_from_slice(&bytes);
@@ -858,7 +898,7 @@ fn create_anthropic_tool_stream(
                             let event = buffer[..pos + 2].to_string();
                             buffer.drain(..pos + 2);
 
-                            match parse_anthropic_sse_chunk_with_tools(&event, tool_states) {
+                            match parse_anthropic_sse_chunk_with_tools(&event, stream_state) {
                                 Ok(Some(chunk)) => results.push(Ok(chunk)),
                                 Ok(None) => {}
                                 Err(e) => results.push(Err(e)),
@@ -1015,6 +1055,47 @@ struct ToolUseState {
     json_buffer: String,
 }
 
+#[derive(Debug, Default)]
+struct AnthropicStreamState {
+    tool_states: HashMap<usize, ToolUseState>,
+    message_start_usage: AnthropicStreamUsage,
+    pending_stop_reason: Option<String>,
+}
+
+impl AnthropicStreamState {
+    fn retain_message_start_usage(&mut self, usage: AnthropicStreamUsage) {
+        if self.message_start_usage.input_tokens.is_none() {
+            self.message_start_usage.input_tokens = usage.input_tokens;
+        }
+        if self
+            .message_start_usage
+            .cache_creation_input_tokens
+            .is_none()
+        {
+            self.message_start_usage.cache_creation_input_tokens =
+                usage.cache_creation_input_tokens;
+        }
+        if self.message_start_usage.cache_read_input_tokens.is_none() {
+            self.message_start_usage.cache_read_input_tokens = usage.cache_read_input_tokens;
+        }
+    }
+
+    fn complete_usage(&self, delta: &AnthropicStreamUsage) -> Option<Usage> {
+        let input_tokens = self.message_start_usage.input_tokens?;
+        let output_tokens = delta.output_tokens?;
+        Some(Usage {
+            prompt_tokens: input_tokens,
+            completion_tokens: output_tokens,
+            total_tokens: input_tokens.checked_add(output_tokens)?,
+            completion_tokens_details: None,
+            prompt_tokens_details: anthropic_prompt_tokens_details(
+                self.message_start_usage.cache_creation_input_tokens,
+                self.message_start_usage.cache_read_input_tokens,
+            ),
+        })
+    }
+}
+
 /// Parses Anthropic SSE chunks with tool use support.
 ///
 /// This parser handles all Anthropic streaming event types including:
@@ -1035,7 +1116,7 @@ struct ToolUseState {
 /// * `Err(LLMError)` - If parsing fails
 fn parse_anthropic_sse_chunk_with_tools(
     chunk: &str,
-    tool_states: &mut HashMap<usize, ToolUseState>,
+    stream_state: &mut AnthropicStreamState,
 ) -> Result<Option<StreamChunk>, LLMError> {
     for line in chunk.lines() {
         let line = line.trim();
@@ -1043,6 +1124,12 @@ fn parse_anthropic_sse_chunk_with_tools(
             match serde_json::from_str::<AnthropicStreamResponse>(data) {
                 Ok(response) => {
                     match response.response_type.as_str() {
+                        "message_start" => {
+                            if let Some(usage) = response.message.and_then(|message| message.usage)
+                            {
+                                stream_state.retain_message_start_usage(usage);
+                            }
+                        }
                         "content_block_start" => {
                             if let (Some(index), Some(content_block)) =
                                 (response.index, response.content_block)
@@ -1052,7 +1139,7 @@ fn parse_anthropic_sse_chunk_with_tools(
                                 let name = content_block.name.unwrap_or_default();
 
                                 // Store state for this tool use block
-                                tool_states.insert(
+                                stream_state.tool_states.insert(
                                     index,
                                     ToolUseState {
                                         id: id.clone(),
@@ -1077,7 +1164,9 @@ fn parse_anthropic_sse_chunk_with_tools(
                                     Some("input_json_delta") => {
                                         if let Some(partial_json) = delta.partial_json {
                                             // Accumulate JSON in state
-                                            if let Some(state) = tool_states.get_mut(&index) {
+                                            if let Some(state) =
+                                                stream_state.tool_states.get_mut(&index)
+                                            {
                                                 state.json_buffer.push_str(&partial_json);
                                             }
                                             return Ok(Some(StreamChunk::ToolUseInputDelta {
@@ -1093,7 +1182,7 @@ fn parse_anthropic_sse_chunk_with_tools(
                         "content_block_stop" => {
                             if let Some(index) = response.index {
                                 // If we have tool state for this index, emit ToolUseComplete
-                                if let Some(state) = tool_states.remove(&index) {
+                                if let Some(state) = stream_state.tool_states.remove(&index) {
                                     // Anthropic API requires tool_use.input to be a JSON object.
                                     // If no input deltas were received (tool has no parameters),
                                     // default to empty object "{}" instead of empty string "".
@@ -1121,6 +1210,19 @@ fn parse_anthropic_sse_chunk_with_tools(
                             if let Some(delta) = response.delta
                                 && let Some(stop_reason) = delta.stop_reason
                             {
+                                stream_state.pending_stop_reason = Some(stop_reason);
+                            }
+                            if let Some(usage) = response.usage
+                                && let Some(usage) = stream_state.complete_usage(&usage)
+                            {
+                                return Ok(Some(StreamChunk::Usage(usage)));
+                            }
+                            if let Some(stop_reason) = stream_state.pending_stop_reason.take() {
+                                return Ok(Some(StreamChunk::Done { stop_reason }));
+                            }
+                        }
+                        "message_stop" => {
+                            if let Some(stop_reason) = stream_state.pending_stop_reason.take() {
                                 return Ok(Some(StreamChunk::Done { stop_reason }));
                             }
                         }
@@ -1162,6 +1264,128 @@ impl LLMBuilder<Anthropic> {
 mod tests {
     use super::*;
     use crate::chat::{FunctionTool, ImageMime};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn serve_one_http_response(response: String) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn anthropic_client_does_not_follow_redirects() {
+        let address = serve_one_http_response(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let client = anthropic_client_builder(Some(1)).build().unwrap();
+
+        let response = client
+            .get(format!("http://{address}/messages"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    }
+
+    #[tokio::test]
+    async fn anthropic_client_hardening_clears_configured_proxies() {
+        let origin_address = serve_one_http_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+        )
+        .await;
+        let unused_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = unused_proxy.local_addr().unwrap();
+        let proxy = reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap();
+        let client = harden_anthropic_client_builder(
+            Client::builder()
+                .proxy(proxy)
+                .timeout(std::time::Duration::from_secs(1)),
+        )
+        .build()
+        .unwrap();
+
+        let response = client
+            .get(format!("http://{origin_address}/messages"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+    }
+
+    #[test]
+    fn anthropic_batch_usage_preserves_cache_provenance() {
+        let response: AnthropicCompleteResponse = serde_json::from_str(
+            r#"{
+                "content": [],
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": 2,
+                    "cache_read_input_tokens": 5
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let usage = ChatResponse::usage(&response).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, Some(7));
+        assert_eq!(details.cache_creation_tokens, Some(2));
+        assert_eq!(details.cache_read_tokens, Some(5));
+    }
+
+    #[test]
+    fn anthropic_stream_usage_preserves_cache_provenance() {
+        let message_start = r#"event: message_start
+data: {"type": "message_start", "message": {"usage": {"input_tokens": 11, "output_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 5}}}
+
+"#;
+        let message_delta = r#"event: message_delta
+data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}
+
+"#;
+        let message_stop = r#"event: message_stop
+data: {"type": "message_stop"}
+
+"#;
+        let mut stream_state = AnthropicStreamState::default();
+
+        assert!(
+            parse_anthropic_sse_chunk_with_tools(message_start, &mut stream_state)
+                .unwrap()
+                .is_none()
+        );
+        let usage =
+            match parse_anthropic_sse_chunk_with_tools(message_delta, &mut stream_state).unwrap() {
+                Some(StreamChunk::Usage(usage)) => usage,
+                other => panic!("Expected Usage chunk, got {other:?}"),
+            };
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 14);
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, Some(7));
+        assert_eq!(details.cache_creation_tokens, Some(2));
+        assert_eq!(details.cache_read_tokens, Some(5));
+        assert!(matches!(
+            parse_anthropic_sse_chunk_with_tools(message_stop, &mut stream_state).unwrap(),
+            Some(StreamChunk::Done { stop_reason }) if stop_reason == "end_turn"
+        ));
+    }
 
     #[test]
     fn test_parse_stream_text_delta() {
@@ -1169,8 +1393,8 @@ mod tests {
 data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}
 
 "#;
-        let mut tool_states = HashMap::new();
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let mut stream_state = AnthropicStreamState::default();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::Text(text)) => assert_eq!(text, "Hello"),
@@ -1184,8 +1408,8 @@ data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta"
 data: {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_01ABC", "name": "get_weather", "input": {}}}
 
 "#;
-        let mut tool_states = HashMap::new();
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let mut stream_state = AnthropicStreamState::default();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::ToolUseStart { index, id, name }) => {
@@ -1197,18 +1421,18 @@ data: {"type": "content_block_start", "index": 1, "content_block": {"type": "too
         }
 
         // Verify state was stored
-        assert!(tool_states.contains_key(&1));
-        assert_eq!(tool_states[&1].id, "toolu_01ABC");
-        assert_eq!(tool_states[&1].name, "get_weather");
+        assert!(stream_state.tool_states.contains_key(&1));
+        assert_eq!(stream_state.tool_states[&1].id, "toolu_01ABC");
+        assert_eq!(stream_state.tool_states[&1].name, "get_weather");
     }
 
     #[test]
     fn test_parse_stream_tool_use_input_delta() {
         let chunk = r#"event: content_block_delta
             data: {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"location\":"}}"#;
-        let mut tool_states = HashMap::default();
+        let mut stream_state = AnthropicStreamState::default();
         // Pre-populate state as if tool_use_start was already processed
-        tool_states.insert(
+        stream_state.tool_states.insert(
             1,
             ToolUseState {
                 id: "toolu_01ABC".to_string(),
@@ -1217,7 +1441,7 @@ data: {"type": "content_block_start", "index": 1, "content_block": {"type": "too
             },
         );
 
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::ToolUseInputDelta {
@@ -1231,7 +1455,7 @@ data: {"type": "content_block_start", "index": 1, "content_block": {"type": "too
         }
 
         // Verify JSON was accumulated
-        assert_eq!(tool_states[&1].json_buffer, "{\"location\":");
+        assert_eq!(stream_state.tool_states[&1].json_buffer, "{\"location\":");
     }
 
     #[test]
@@ -1240,9 +1464,9 @@ data: {"type": "content_block_start", "index": 1, "content_block": {"type": "too
 data: {"type": "content_block_stop", "index": 1}
 
 "#;
-        let mut tool_states = HashMap::new();
+        let mut stream_state = AnthropicStreamState::default();
         // Pre-populate state with accumulated JSON
-        tool_states.insert(
+        stream_state.tool_states.insert(
             1,
             ToolUseState {
                 id: "toolu_01ABC".to_string(),
@@ -1251,7 +1475,7 @@ data: {"type": "content_block_stop", "index": 1}
             },
         );
 
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::ToolUseComplete { index, tool_call }) => {
@@ -1264,7 +1488,7 @@ data: {"type": "content_block_stop", "index": 1}
         }
 
         // Verify state was removed
-        assert!(!tool_states.contains_key(&1));
+        assert!(!stream_state.tool_states.contains_key(&1));
     }
 
     #[test]
@@ -1276,9 +1500,9 @@ data: {"type": "content_block_stop", "index": 1}
 data: {"type": "content_block_stop", "index": 1}
 
 "#;
-        let mut tool_states = HashMap::default();
+        let mut stream_state = AnthropicStreamState::default();
         // Pre-populate state with EMPTY json_buffer (no input_json_delta events received)
-        tool_states.insert(
+        stream_state.tool_states.insert(
             1,
             ToolUseState {
                 id: "toolu_01XYZ".to_string(),
@@ -1287,7 +1511,7 @@ data: {"type": "content_block_stop", "index": 1}
             },
         );
 
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::ToolUseComplete { index, tool_call }) => {
@@ -1304,7 +1528,7 @@ data: {"type": "content_block_stop", "index": 1}
         }
 
         // Verify state was removed
-        assert!(!tool_states.contains_key(&1));
+        assert!(!stream_state.tool_states.contains_key(&1));
     }
 
     #[test]
@@ -1313,8 +1537,8 @@ data: {"type": "content_block_stop", "index": 1}
 data: {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
 
 "#;
-        let mut tool_states = HashMap::new();
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let mut stream_state = AnthropicStreamState::default();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::Done { stop_reason }) => {
@@ -1330,8 +1554,8 @@ data: {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
 data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}
 
 "#;
-        let mut tool_states = HashMap::new();
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let mut stream_state = AnthropicStreamState::default();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::Done { stop_reason }) => {
@@ -1343,14 +1567,14 @@ data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}
 
     #[test]
     fn test_parse_stream_full_tool_use_sequence() {
-        let mut tool_states = HashMap::new();
+        let mut stream_state = AnthropicStreamState::default();
 
         // 1. Tool use start
         let start_chunk = r#"event: content_block_start
 data: {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_01ABC", "name": "get_weather", "input": {}}}
 
 "#;
-        let result = parse_anthropic_sse_chunk_with_tools(start_chunk, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(start_chunk, &mut stream_state).unwrap();
         assert!(matches!(result, Some(StreamChunk::ToolUseStart { .. })));
 
         // 2. Input JSON deltas
@@ -1358,23 +1582,26 @@ data: {"type": "content_block_start", "index": 1, "content_block": {"type": "too
 data: {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"loc"}}
 
 "#;
-        let _ = parse_anthropic_sse_chunk_with_tools(delta1, &mut tool_states).unwrap();
+        let _ = parse_anthropic_sse_chunk_with_tools(delta1, &mut stream_state).unwrap();
 
         let delta2 = r#"event: content_block_delta
 data: {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "ation\": \"Paris\"}"}}
 
 "#;
-        let _ = parse_anthropic_sse_chunk_with_tools(delta2, &mut tool_states).unwrap();
+        let _ = parse_anthropic_sse_chunk_with_tools(delta2, &mut stream_state).unwrap();
 
         // Verify accumulated JSON
-        assert_eq!(tool_states[&1].json_buffer, "{\"location\": \"Paris\"}");
+        assert_eq!(
+            stream_state.tool_states[&1].json_buffer,
+            "{\"location\": \"Paris\"}"
+        );
 
         // 3. Content block stop
         let stop_chunk = r#"event: content_block_stop
 data: {"type": "content_block_stop", "index": 1}
 
 "#;
-        let result = parse_anthropic_sse_chunk_with_tools(stop_chunk, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(stop_chunk, &mut stream_state).unwrap();
 
         match result {
             Some(StreamChunk::ToolUseComplete { tool_call, .. }) => {
@@ -1388,7 +1615,7 @@ data: {"type": "content_block_stop", "index": 1}
 data: {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
 
 "#;
-        let result = parse_anthropic_sse_chunk_with_tools(done_chunk, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(done_chunk, &mut stream_state).unwrap();
         assert!(matches!(
             result,
             Some(StreamChunk::Done {
@@ -1399,14 +1626,14 @@ data: {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
 
     #[test]
     fn test_parse_stream_mixed_text_and_tool() {
-        let mut tool_states = HashMap::new();
+        let mut stream_state = AnthropicStreamState::default();
 
         // Text delta first
         let text_chunk = r#"event: content_block_delta
 data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I'll check the weather"}}
 
 "#;
-        let result = parse_anthropic_sse_chunk_with_tools(text_chunk, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(text_chunk, &mut stream_state).unwrap();
         assert!(matches!(result, Some(StreamChunk::Text(t)) if t == "I'll check the weather"));
 
         // Then tool use
@@ -1414,7 +1641,7 @@ data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta"
 data: {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_01XYZ", "name": "weather", "input": {}}}
 
 "#;
-        let result = parse_anthropic_sse_chunk_with_tools(tool_start, &mut tool_states).unwrap();
+        let result = parse_anthropic_sse_chunk_with_tools(tool_start, &mut stream_state).unwrap();
         assert!(
             matches!(result, Some(StreamChunk::ToolUseStart { name, .. }) if name == "weather")
         );
@@ -1426,8 +1653,8 @@ data: {"type": "content_block_start", "index": 1, "content_block": {"type": "too
 data: {"type": "message_start", "message": {"id": "msg_123", "type": "message", "role": "assistant"}}
 
 "#;
-        let mut tool_states = HashMap::new();
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let mut stream_state = AnthropicStreamState::default();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
         assert!(result.is_none());
     }
 
@@ -1437,8 +1664,8 @@ data: {"type": "message_start", "message": {"id": "msg_123", "type": "message", 
 data: {"type": "ping"}
 
 "#;
-        let mut tool_states = HashMap::new();
-        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut tool_states).unwrap();
+        let mut stream_state = AnthropicStreamState::default();
+        let result = parse_anthropic_sse_chunk_with_tools(chunk, &mut stream_state).unwrap();
         assert!(result.is_none());
     }
 
