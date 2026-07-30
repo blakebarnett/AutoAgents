@@ -128,6 +128,12 @@ pub struct PromptTokensDetails {
     /// Tokens used for cached content
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
+    /// Tokens used to create cached content
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// Tokens read from cached content
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
     /// Tokens used for audio input
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_tokens: Option<u32>,

@@ -25,6 +25,10 @@ pub struct PromptTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_tokens: Option<u32>,
 }
 
@@ -154,11 +158,27 @@ mod tests {
             }),
             prompt_tokens_details: Some(PromptTokensDetails {
                 cached_tokens: Some(2),
+                cache_creation_tokens: Some(1),
+                cache_read_tokens: Some(1),
                 audio_tokens: None,
             }),
         };
         let serialized = serde_json::to_value(&usage).unwrap();
         assert!(serialized.get("completion_tokens_details").is_some());
         assert!(serialized.get("prompt_tokens_details").is_some());
+        assert_eq!(
+            serialized["prompt_tokens_details"]["cache_creation_tokens"],
+            1
+        );
+        assert_eq!(serialized["prompt_tokens_details"]["cache_read_tokens"], 1);
+    }
+
+    #[test]
+    fn prompt_token_details_remain_compatible_without_cache_provenance() {
+        let details: PromptTokensDetails = serde_json::from_str(r#"{"cached_tokens":2}"#).unwrap();
+
+        assert_eq!(details.cached_tokens, Some(2));
+        assert_eq!(details.cache_creation_tokens, None);
+        assert_eq!(details.cache_read_tokens, None);
     }
 }
